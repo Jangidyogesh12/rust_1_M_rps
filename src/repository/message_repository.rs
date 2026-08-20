@@ -2,13 +2,13 @@ use crate::{
     config::database::{Database, DatabaseTrait},
     dto::message_dto::MessageCreateDto,
     entity::message::Message,
+    error::db_error::DbError,
 };
 use async_trait::async_trait;
 use sqlx::Error as SqlxError;
-use std::{io::Error, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Clone)]
-
 pub struct MessageRepository {
     pub(crate) db_conn: Arc<Database>,
 }
@@ -16,7 +16,7 @@ pub struct MessageRepository {
 #[async_trait]
 pub trait MessageRepositoryTrait {
     fn new(db_conn: &Arc<Database>) -> Self;
-    async fn create(&self, payload: MessageCreateDto) -> Result<Message, Error>;
+    async fn create(&self, payload: MessageCreateDto) -> Result<Message, DbError>;
 }
 
 #[async_trait]
@@ -26,7 +26,7 @@ impl MessageRepositoryTrait for MessageRepository {
             db_conn: Arc::clone(db_conn),
         }
     }
-    async fn create(&self, payload: MessageCreateDto) -> Result<Message, Error> {
+    async fn create(&self, payload: MessageCreateDto) -> Result<Message, DbError> {
         let message = sqlx::query_as::<_, Message>(
             r#"
                    INSERT INTO messages (id, "from", "to", message)
@@ -39,8 +39,12 @@ impl MessageRepositoryTrait for MessageRepository {
         .bind(payload.to)
         .bind(payload.message)
         .fetch_one(self.db_conn.get_pool())
-        .await..map_err(|e| match e {
-            SqlxError::Database(e) => DbError::SomethingWentWrong(e.to_string()),
+        .await
+        .map_err(|e| match e {
+            SqlxError::Database(e) => match e.code().as_deref() {
+                Some("23505") => DbError::UniqueConstraintViolation(e.to_string()),
+                _ => DbError::SomethingWentWrong(e.to_string()),
+            },
             _ => DbError::SomethingWentWrong(e.to_string()),
         })?;
 

@@ -1,0 +1,31 @@
+{
+  "info": {
+    "name": "Rust 1M - Messages",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create Message",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json", "type": "text" }
+        ],
+        "url": {
+          "raw": "http://127.0.0.1:3000/message",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "3000",
+          "path": ["message"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"from\": \"alice\",\n  \"to\": \"bob\",\n  \"message\": \"Hello from Postman!\"\n}",
+          "options": {
+            "raw": { "language": "json" }
+          }
+        }
+      }
+    }
+  ]
+}

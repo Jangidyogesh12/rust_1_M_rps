@@ -4,24 +4,10 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct ApiSuccessResponse<T: Serialize> {
-    data: T,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ApiErrorResponse {
     message: Option<String>,
     #[serde(rename = "code")]
     status: u16,
-}
-
-impl<T: Serialize> ApiSuccessResponse<T>
-where
-    T: Serialize,
-{
-    pub(crate) fn send(data: T) -> Self {
-        ApiSuccessResponse { data }
-    }
 }
 
 impl ApiErrorResponse {

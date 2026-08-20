@@ -1,6 +1,7 @@
-use axum::Router;
+use axum::{Router, routing::post};
 
-pub fn route() -> Router {
-    let router = Router::new().route("/message", post());
-    router
+use crate::{handler::message_handler::message_handler, state::message_state::MessageState};
+
+pub fn route() -> Router<MessageState> {
+    Router::new().route("/message", post(message_handler))
 }

@@ -5,6 +5,7 @@ use uuid::Uuid;
 pub struct Message {
     pub id: Uuid,
     pub from: String,
+    pub to: String,
     pub message: String,
     pub created_at: OffsetDateTime,
 }
