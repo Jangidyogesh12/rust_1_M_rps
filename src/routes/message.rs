@@ -1,4 +1,4 @@
-use axum::{Router, routing::post};
+use axum::{routing::post, Router};
 
 use crate::{handler::message_handler::message_handler, state::message_state::MessageState};
 

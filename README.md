@@ -2,6 +2,8 @@
 
 A high-performance Rust web service for persisting messages, built with **Axum** + **SQLx (PostgreSQL)** and structured around a clean, layered architecture. The project is a load-test target aimed at measuring throughput (up to ~1M requests/sec).
 
+_This is the Rust implementation of [node-1m-rps](https://github.com/agile8118/node-1m-rps) by [@agile8118](https://github.com/agile8118)._
+
 ## Features
 
 - Asynchronous HTTP server with [Axum](https://github.com/tokio-rs/axum) (HTTP/2, macros, WebSocket ready)
@@ -170,6 +172,19 @@ autocannon -m POST \
 ```
 
 ## Notes
+
+- **Why this Rust port needs no PM2-style clustering (unlike the Node original).**
+  Node.js is **single-threaded per process** — one event loop runs on one OS thread, so a single Node process can only ever use **one CPU core**. The Node original therefore *must* run under PM2 with `instances: "max"` and `exec_mode: "cluster"` (`ecosystem.config.cjs`) to fork one worker process per core and share the listening port via the OS cluster module. That clustering is not an optimization there — it is the only way Node touches more than one core.
+
+  This Rust port does not need any of that. The runtime is configured at `src/main.rs` with the `#[tokio::main]` macro plus `tokio = { features = ["full"] }` in `Cargo.toml`. The `"full"` feature pulls in `rt-multi-thread`, so `#[tokio::main]` expands to `tokio::runtime::Builder::new_multi_thread().enable_all().build()` — a **multi-thread work-stealing scheduler** with **one worker thread per logical CPU core** (default = `std::thread::available_parallelism()`). When `axum::serve` accepts a connection it becomes a tokio *task*, and tokio spreads tasks across all N worker threads (stealing work between them) **all inside a single process**. In other words: the parallelism the Node author obtains through N OS processes, Rust obtains through N OS threads in one process, automatically. That is why CPU utilization reaches ~99% (0–1% idle) here with **zero clustering code**.
+
+  |                       | Node (`node-1m-rps`)              | Rust (this repo)                         |
+  | --------------------- | --------------------------------- | ---------------------------------------- |
+  | Threads per process   | 1 (single event loop)             | N (= logical CPU cores)                  |
+  | Uses all cores        | only via PM2 `instances: "max"`    | automatic via tokio `rt-multi-thread`    |
+  | Clustering needed?    | **yes** (process-per-core)        | **no** (thread-per-core in one process)  |
+
+  Caveat: a single `TcpListener` + single accept loop means request *handling* is parallel across cores but connection *acceptance* is serialized on one task. With keep-alive + pipelining on a modest number of connections (as in the load test below) this is fine. PM2's N processes each get their own listener (via `SO_REUSEPORT`), so Node sidesteps the single-acceptor ceiling — if that ever becomes the bottleneck here, `SO_REUSEPORT` + multiple processes would be the equivalent fix, but it is **not** required for basic core utilization.
 
 - **Migrations are CLI-only.** The app does *not* run migrations on startup — always run `sqlx migrate run` after starting a fresh database container.
 - **Persist Postgres data across containers** by using a named volume, otherwise each new container starts empty:
