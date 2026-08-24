@@ -15,4 +15,5 @@ uuid = { workspace = true }
 validator = { workspace = true }
 time = { workspace = true }
 redis = { workspace = true }
+sqlx = { workspace = true }
 shared = { workspace = true }

@@ -1,5 +1,6 @@
 use log::{error, info};
 use shared::config::{
+    database::{Database, DatabaseTrait},
     parameter,
     redis::{Redis, RedisTrait},
 };
@@ -33,6 +34,12 @@ async fn main() {
         exit(1)
     });
 
+    let database = Database::init().await.unwrap_or_else(|e| {
+        error!("{}", e);
+        exit(1)
+    });
+    let pg_pool = database.get_pool().clone();
+
     let app_url = parameter::get("APP_URL").unwrap_or_else(|e| {
         error!("{}", e);
         exit(1);
@@ -52,7 +59,7 @@ async fn main() {
         exit(1);
     });
 
-    let app = routes::root::routes(redis);
+    let app = routes::root::routes(redis, pg_pool);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

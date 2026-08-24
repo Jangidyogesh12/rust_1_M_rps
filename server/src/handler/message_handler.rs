@@ -18,3 +18,15 @@ pub async fn message_fast_handler(
     let message = state.message_service.create_message(payload).await?;
     Ok((StatusCode::CREATED, Json(message)))
 }
+
+pub async fn message_direct_handler(
+    State(state): State<MessageState>,
+    Json(payload): Json<MessageCreateDto>,
+) -> Result<(StatusCode, Json<MessageReadDto>), ApiErrorResponse> {
+    if let Err(e) = payload.validate() {
+        return Err(ApiError::ValidationError(e.to_string()).into());
+    }
+
+    let message = state.message_service.create_message_direct(payload).await?;
+    Ok((StatusCode::CREATED, Json(message)))
+}
