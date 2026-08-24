@@ -1,37 +1,131 @@
-# rust-1M-rps
+# From 5.7k to 56k RPS: How I Made Rust Say Yes to a Million Requests
 
-A high-performance Rust web service for persisting messages, built with **Axum** + **Redis Streams** + **SQLx (PostgreSQL)** and structured around a clean, layered architecture. The project is a load-test target aimed at measuring throughput (up to ~1M requests/sec).
+> A story about one endpoint, two designs, and a CPU graph that refused to lie to me.
 
-_This is the Rust implementation of [node-1m-rps](https://github.com/agile8118/node-1m-rps) by [@agile8118](https://github.com/agile8118)._
+This is a Rust web service that accepts messages over HTTP and persists them. Simple, right? That's what I thought too. But somewhere between "just write it to Postgres" and serving **1.12 million requests in a 20-second load test**, I learned a lot about where throughput actually goes to die.
 
-## Features
+This project is my Rust implementation of [node-1m-rps](https://github.com/agile8118/node-1m-rps) by [@agile8118](https://github.com/agile8118) — rebuilt with **Axum + Redis Streams + SQLx (PostgreSQL)**, and benchmarked every step of the way with [autocannon](https://github.com/mcollina/autocannon).
 
-- Asynchronous HTTP server with [Axum](https://github.com/tokio-rs/axum) (HTTP/2, macros, WebSocket ready)
-- **Redis Streams** as a high-throughput message broker between the API and the database
-- **Background sync worker** that reads from Redis Streams and batch-inserts into PostgreSQL
-- PostgreSQL persistence with [SQLx](https://github.com/launchbadge/sqlx) (compile-time-checked queries via `query_as`)
-- Layered design: `handler -> service -> repository -> entity`
-- Request validation with [validator](https://github.com/Keats/validator)
-- Ergonomic error handling with [thiserror](https://github.com/dtolnay/thiserror), mapped to proper HTTP status codes
-- UUID primary keys generated server-side
-- SQLx CLI migrations (no in-code migration side effects)
+If you just want to run it, jump to [Run it yourself](#run-it-yourself). Otherwise, grab a coffee — this is how it went.
 
-## Tech Stack
+---
 
-| Concern        | Crate                                                          |
-| -------------- | -------------------------------------------------------------- |
-| Web framework  | `axum 0.8`                                                     |
-| Runtime        | `tokio`                                                        |
-| Database       | `sqlx 0.9` (Postgres, `time`, `uuid`)                          |
-| Message broker | `redis 1.6` (async, connection manager, stream groups)         |
-| Validation     | `validator 0.20`                                               |
-| Errors         | `thiserror 2.0`                                                |
-| IDs / time     | `uuid 1.24`, `time 0.3`                                        |
-| Env loading    | `dotenv`                                                       |
+## The Setup
 
-## Architecture
+The requirements were honest and small:
 
-The project uses a **decoupled write path**: the HTTP server writes messages to a Redis Stream, and a background `sync` worker consumes from that stream and persists to PostgreSQL in batches.
+- `POST` a message (`from`, `to`, `message`)
+- Persist it to PostgreSQL
+- Return a `201` with the created message
+
+The stack:
+
+| Concern        | Choice                                        |
+| -------------- | --------------------------------------------- |
+| Web framework  | `axum 0.8`                                    |
+| Runtime        | `tokio` (multi-thread, work-stealing)         |
+| Database       | `sqlx 0.9` + PostgreSQL 17                    |
+| Message broker | `redis 1.6` (Streams + consumer groups)       |
+| Validation     | `validator 0.20`                              |
+| Errors         | `thiserror 2.0`                               |
+
+A layered structure, because future-me deserves clean code too:
+
+```
+Request -> routes -> handler -> service -> repository -> ???
+                              \- entity (domain) / dto (transport)
+```
+
+That `???` at the end of the pipeline is where this whole story lives.
+
+---
+
+## Act 1: The Naive Version — Write Straight to Postgres
+
+First version: HTTP request comes in, we validate it, run an `INSERT`, return. One database, zero moving parts.
+
+```rust
+pub async fn create_message_direct(
+    &self,
+    payload: MessageCreateDto,
+) -> Result<MessageReadDto, ApiError> {
+    let message = Message {
+        id: Uuid::new_v4(),
+        from: payload.from_,
+        to: payload.to,
+        message: payload.message,
+        created_at: OffsetDateTime::now_utc(),
+    };
+
+    sqlx::query(
+        r#"INSERT INTO messages (id, "from", "to", message, created_at)
+           VALUES ($1, $2, $3, $4, $5)"#,
+    )
+    .bind(message.id)
+    .bind(&message.from)
+    .bind(&message.to)
+    .bind(&message.message)
+    .bind(message.created_at)
+    .execute(&self.pg_pool)
+    .await?;
+
+    Ok(MessageReadDto::from(message))
+}
+```
+
+Clean. Readable. Correct. And — spoiler — **10x slower than what I ended up with**.
+
+### Enter autocannon
+
+I fired up [autocannon](https://github.com/mcollina/autocannon) to see what this thing could actually do:
+
+```bash
+autocannon -m POST \
+  --connections 100 --duration 20 --pipelining 20 \
+  -H "Content-Type: application/json" \
+  -b '{"from":"alice","to":"bob","message":"Hello from Postman!"}' \
+  "http://127.0.0.1:3000/message"
+```
+
+100 connections, 20x pipelining, 20 seconds. Here's what came back:
+
+![Autocannon results — direct Postgres writes](public/before.png)
+
+| Metric           | Value                          |
+| ---------------- | ------------------------------ |
+| Avg latency      | **345.77 ms** (p50: 342 ms)    |
+| p99 latency      | 470 ms                         |
+| Avg throughput   | **~5,727 req/sec**             |
+| Total requests   | 117k in 20s                    |
+
+~5.7k RPS and a third of a second of latency per request. For a Rust server on a modern machine, that's... suspicious. Rust isn't slow, so something else was.
+
+---
+
+## Act 2: The CPU Graph That Refused to Lie
+
+I opened the core utilization graph while the test was running, and this is what I saw:
+
+![CPU core usage — direct Postgres writes](public/core_usage_before.png)
+
+**50–55% idle. On every core. Under full load.**
+
+Half my CPU was sitting there doing absolutely nothing while my server was allegedly getting hammered.
+
+And that was the clue. Tokio's multi-thread runtime already spreads work across one worker thread per logical core — the machinery was there. The problem was what those threads were *doing*: each request handler `await`s a Postgres `INSERT`. While it waits on the database (disk flush, WAL, connection pool checkout, network round-trip), the request is parked. Work is *available* — 100 connections × 20 pipelined requests deep — but every single one of them funnels through synchronous DB writes, one at a time, per request.
+
+The server wasn't CPU-bound. It was **database-round-trip-bound**. Postgres is a fantastic database, but it is not an in-memory buffer, and asking it to durably store 100+ individual rows per second *per connection* turns your fancy async runtime into a very expensive waiting room.
+
+So the question became: **how do I keep the CPU fed and stop making every request pay the disk-flush tax?**
+
+---
+
+## Act 3: Put Redis in the Hot Path
+
+The insight: an HTTP `201` doesn't require the row to be *in Postgres* yet. It requires the message to be *safely accepted*. So I split the write path:
+
+1. **Hot path:** HTTP handler → `XADD` to a Redis Stream → return `201`. Redis is in-memory and append-only; this is microseconds, not milliseconds.
+2. **Cold path:** a background worker consumes the stream and batch-inserts into Postgres at its own pace.
 
 ```
 HTTP Request
@@ -41,72 +135,172 @@ HTTP Request
 | Server | ----------------------------> | Redis: messages  |
 |        |                               | :stream          |
 +--------+                               +------------------+
-                                              |
-                                              | XREADGROUP
-                                              v
-                                        +------------------+
-                                        | Sync Worker      |
-                                        | (batch insert)   |
-                                        +------------------+
-                                              |
-                                              | INSERT ...
-                                              v
-                                        +------------------+
-                                        | PostgreSQL       |
-                                        +------------------+
+                                               |
+                                               | XREADGROUP
+                                               v
+                                         +------------------+
+                                         | Sync Worker      |
+                                         | (batch insert)   |
+                                         +------------------+
+                                               |
+                                               | INSERT ... 500 rows
+                                               v
+                                         +------------------+
+                                         | PostgreSQL       |
+                                         +------------------+
 ```
 
-### Workspace Members
+### The hot path: one XADD, done
 
-| Crate    | Purpose                                    |
-| -------- | ------------------------------------------ |
-| `server` | Axum HTTP API — validates and publishes    |
-| `sync`   | Background consumer — batch-persists       |
-| `shared` | Common config, errors, and message types   |
+The repository layer changed from "talk to Postgres" to "append to a stream":
 
-### Server Layout
+```rust
+async fn create(&self, payload: MessageCreateDto) -> Result<Message, DbError> {
+    let message = Message {
+        id: Uuid::new_v4(),
+        from: payload.from_,
+        to: payload.to,
+        message: payload.message,
+        created_at: OffsetDateTime::now_utc(),
+    };
 
-```
-Request -> routes -> handler -> service -> repository -> Redis Stream
-                                    \- entity (domain) / dto (transport)
-```
+    let data = serde_json::to_string(&message)
+        .map_err(|e| DbError::SomethingWentWrong(e.to_string()))?;
 
-```
-server/src/
-├── config/        # DB connection + env parameters
-├── dto/           # Request/Response DTOs (MessageCreateDto, MessageReadDto)
-├── entity/        # Domain entity (Message)
-├── error/         # ApiError, DbError -> HTTP status mapping
-├── handler/       # Axum handlers (validation -> service call)
-├── repository/    # Redis data access (MessageRepository)
-├── response/      # JSON error envelope (ApiErrorResponse)
-├── routes/        # Router + state wiring
-├── service/       # Business logic (MessageService)
-└── state/         # Per-feature app state (MessageState)
-```
+    let mut conn = self.db_conn.get_connection();
 
-### Sync Worker Layout
+    let _ = conn
+        .xgroup_create_mkstream(Message::STREAM, Message::GROUP, "$")
+        .await;
 
-```
-sync/src/
-├── consumer/
-│   ├── mod.rs                 # Module declaration
-│   └── message_consumer.rs    # Redis read -> parse -> batch insert -> ACK
-└── main.rs                    # Entry point (Redis + DB init, consumer loop)
+    let _: Option<String> = conn
+        .xadd(Message::STREAM, "*", &[("data", data.as_str())])
+        .await
+        .map_err(|e| DbError::SomethingWentWrong(e.to_string()))?;
+
+    Ok(message)
+}
 ```
 
-The consumer reads messages in batches (up to 500), deserializes them, inserts valid messages into PostgreSQL via `sqlx::QueryBuilder::push_values(...)` with `ON CONFLICT (id) DO NOTHING`, and ACKs the Redis entries only after a successful insert.
+(That `xgroup_create_mkstream` call on every write looks odd, but it's idempotent — it just guarantees the consumer group exists before the worker ever reads. Errors are ignored on purpose.)
 
-## Prerequisites
+I kept the old direct-write endpoint at `POST /message` and exposed the new path as `POST /message-fast` — same validation, same response shape, so I could A/B them against each other:
+
+```rust
+pub fn route() -> Router<MessageState> {
+    Router::new()
+        .route("/message-fast", post(message_fast_handler))
+        .route("/message", post(message_direct_handler))
+}
+```
+
+### The cold path: batch like you mean it
+
+The `sync` worker is a separate binary that loops forever:
+
+- **`XREADGROUP`** with `count(500)` and `block(300ms)` — pull up to 500 messages per read
+- **one bulk `INSERT`** for the whole batch via `sqlx::QueryBuilder::push_values`
+- **`XACK`** only *after* a successful insert
+
+```rust
+async fn insert_batch(&self, entries: &[StreamEntry]) -> Result<(), sqlx::Error> {
+    let mut qb =
+        QueryBuilder::new(r#"INSERT INTO messages (id, "from", "to", message, created_at) "#);
+
+    qb.push_values(entries, |mut b, entry| {
+        b.push_bind(entry.message.id)
+            .push_bind(&entry.message.from)
+            .push_bind(&entry.message.to)
+            .push_bind(&entry.message.message)
+            .push_bind(entry.message.created_at);
+    });
+
+    qb.push(" ON CONFLICT (id) DO NOTHING");
+
+    qb.build().execute(&self.db_pool).await?;
+    Ok(())
+}
+```
+
+Instead of 500 round-trips, Postgres now handles 500 rows in **one** statement. The database gets durable writes at a pace it likes, and the message stays safe in Redis the entire time — if the batch insert fails, the worker doesn't ACK, and Redis simply redelivers those entries on the next read. Poison messages (bad JSON, missing fields) get ACKed immediately so one malformed entry can't clog the stream.
+
+And because every message carries a server-generated UUID plus `ON CONFLICT (id) DO NOTHING`, a crash-between-insert-and-ACK scenario — the classic at-least-once duplication — is silently absorbed. At-least-once delivery becomes effectively exactly-once persistence.
+
+---
+
+## Act 4: The Numbers
+
+Same machine. Same autocannon flags. New endpoint:
+
+```bash
+autocannon -m POST \
+  --connections 100 --duration 20 --pipelining 20 \
+  -H "Content-Type: application/json" \
+  -b '{"from":"alice","to":"bob","message":"Hello from Postman!"}' \
+  "http://127.0.0.1:3000/message-fast"
+```
+
+![Autocannon results — Redis Streams write path](public/after.png)
+
+| Metric           | Before (direct PG)             | After (Redis stream)           | Δ            |
+| ---------------- | ------------------------------ | ------------------------------ | ------------ |
+| Avg latency      | 345.77 ms                      | **35.25 ms**                   | **~10x**     |
+| p99 latency      | 470 ms                         | 41 ms                          | ~11x         |
+| Avg throughput   | ~5,727 req/sec                 | **~55,899 req/sec**            | **~10x**     |
+| Total requests   | 117k in 20s                    | **1.12M in 20s**               | ~10x         |
+| Data transferred | 29.8 MB                        | 291 MB                         | ~10x         |
+
+And the part I was most curious about — the CPU graph:
+
+![CPU core usage — Redis Streams write path](public/core_usage_after.png)
+
+**Idle dropped from 50–55% to 6–7%.** The cores that were previously napping while handlers waited on Postgres are now actually processing requests. Same runtime, same thread count, same machine — the only change was removing the disk round-trip from the request path. The throughput gain didn't come from working *harder*; it came from stopping the CPU from *waiting*.
+
+### Why no PM2-style clustering?
+
+The original Node project needs PM2 with `instances: "max"` and `exec_mode: "cluster"` — because Node is single-threaded per process, and forking one process per core is the *only* way it can use more than one core.
+
+Rust needs none of that here. `#[tokio::main]` with `features = ["full"]` gives you a multi-thread work-stealing scheduler with one worker thread per logical core, inside a single process. Connections become tokio tasks and get spread across all workers automatically.
+
+|                       | Node (`node-1m-rps`)              | Rust (this repo)                         |
+| --------------------- | --------------------------------- | ---------------------------------------- |
+| Threads per process  | 1 (single event loop)             | N (= logical CPU cores)                  |
+| Uses all cores       | only via PM2 `instances: "max"`   | automatic via tokio `rt-multi-thread`    |
+| Clustering needed?   | **yes** (process-per-core)        | **no** (thread-per-core in one process)  |
+
+Honest caveat: with a single `TcpListener`, connection *acceptance* is serialized on one task even though request *handling* is parallel. With keep-alive + pipelining on a modest number of connections, that's a non-issue. If it ever becomes the ceiling, `SO_REUSEPORT` + multiple processes is the equivalent fix — PM2 just does that trick by default.
+
+---
+
+## What I Took Away From This
+
+1. **Measure before you optimize.** I assumed the bottleneck was "Rust + JSON parsing" or something glamorous. The CPU graph said: nope, you're I/O-bound, half the machine is idle.
+2. **"Slow" is often just "waiting."** The 10x didn't come from making anything faster — it came from taking a disk-flip out of the request's critical path.
+3. **Buffering writes isn't cheating durability.** Redis Streams + consumer groups + ACK-after-insert + idempotent batch inserts means nothing is lost, and a crash is a redelivery, not data loss.
+4. **Boring architecture, fast numbers.** The winning design is a textbook decoupled write path — it just took me a load test and an idle CPU graph to actually respect it.
+
+## What's Next
+
+The natural follow-ups, in the order I'll probably attack them:
+
+- **Dead-letter stream** — the `messages:dead` constant already exists; the worker just doesn't publish to it yet
+- **`SO_REUSEPORT` + multiple acceptors** if the single-acceptor ceiling ever shows up in a profile
+- Tuning `XREADGROUP` batch size / block time against different Postgres configs
+- Running the whole thing on real hardware instead of my laptop, where "1M rps" stops being "1M requests per 20-second run" and starts being per second 🙂
+
+---
+
+## Run It Yourself
+
+### Prerequisites
 
 - Rust (stable) — https://rustup.rs
 - Docker (for Postgres + Redis)
 - `sqlx-cli` for migrations:
+
   ```bash
   cargo install sqlx-cli --no-default-features --features postgres
   ```
-
-## Getting Started
 
 ### 1. Start Postgres
 
@@ -115,13 +309,16 @@ docker run -d --name message_db -p 5432:5432 \
   -e POSTGRES_PASSWORD=mysecretpassword \
   -e POSTGRES_USER=dbuser \
   -e POSTGRES_DB=message \
+  -v message_pgdata:/var/lib/postgresql/data \
   postgres:17
 ```
 
 ### 2. Start Redis
 
 ```bash
-docker run -d --name message_redis -p 6379:6379 redis:7
+docker run -d --name message_redis -p 6379:6379 \
+  -v message_redisdata:/data \
+  redis:7 redis-server --appendonly yes
 ```
 
 ### 3. Configure environment
@@ -174,18 +371,45 @@ cargo run -p sync
 # Consumer 'sync-worker-1' started on stream 'messages:stream'
 ```
 
-You can run multiple sync workers with different `CONSUMER_NAME` values for parallel consumption (Redis handles load-balancing across the consumer group).
+Run multiple sync workers with different `CONSUMER_NAME` values for parallel consumption — Redis load-balances across the consumer group.
+
+### 6. Benchmark it
+
+```bash
+# install once
+npm i -g autocannon
+
+# the fast path (Redis Streams + sync worker)
+autocannon -m POST \
+  --connections 100 --duration 20 --pipelining 20 \
+  -H "Content-Type: application/json" \
+  -b '{"from":"alice","to":"bob","message":"Hello from Postman!"}' \
+  "http://127.0.0.1:3000/message-fast"
+
+# the old direct-write path, for comparison
+autocannon -m POST \
+  --connections 100 --duration 20 --pipelining 20 \
+  -H "Content-Type: application/json" \
+  -b '{"from":"alice","to":"bob","message":"Hello from Postman!"}' \
+  "http://127.0.0.1:3000/message"
+```
+
+---
 
 ## API Reference
 
+### `POST /message-fast`
+
+Create a message via the fast path — published to the Redis Stream `messages:stream`, persisted to PostgreSQL asynchronously by the sync worker.
+
 ### `POST /message`
 
-Create a new message. The message is published to the Redis Stream `messages:stream` and later persisted to PostgreSQL by the sync worker.
+Create a message via the direct path — synchronous `INSERT` into PostgreSQL, kept around for A/B comparison.
 
 **Request**
 
 ```http
-POST /message HTTP/1.1
+POST /message-fast HTTP/1.1
 Content-Type: application/json
 
 {
@@ -199,9 +423,9 @@ Content-Type: application/json
 | --------- | ------ | --------------------- |
 | `from`    | string | required              |
 | `to`      | string | required              |
-| `message` | string | length 1--1000 chars |
+| `message` | string | length 1--1000 chars  |
 
-**Success response** -- `201 Created`
+**Success response** — `201 Created`
 
 ```json
 {
@@ -225,62 +449,30 @@ Content-Type: application/json
 | 409    | Unique constraint violation |
 | 500    | Other database error        |
 
-## Load Testing
+---
 
-A Postman collection (`postman_collection.json`) is included for manual checks. For throughput benchmarking, use [autocannon](https://github.com/mcollina/autocannon):
+## Workspace Layout
 
-```bash
-# install once
-npm i -g autocannon
-
-# standard run
-autocannon -m POST \
-  --connections 10 --duration 20 --pipelining 2 \
-  -H "Content-Type: application/json" \
-  -b '{"from":"alice","to":"bob","message":"Hello from Postman!"}' \
-  "http://127.0.0.1:3000/message"
+| Crate    | Purpose                                  |
+| -------- | ---------------------------------------- |
+| `server` | Axum HTTP API — validates and publishes  |
+| `sync`   | Background consumer — batch-persists     |
+| `shared` | Common config, errors, and message types |
 
 ```
+server/src/
+├── config/        # DB connection + env parameters
+├── dto/           # Request/Response DTOs (MessageCreateDto, MessageReadDto)
+├── entity/        # Domain entity (Message)
+├── error/         # ApiError, DbError -> HTTP status mapping
+├── handler/       # Axum handlers (validation -> service call)
+├── repository/    # Redis data access (MessageRepository)
+├── response/      # JSON error envelope (ApiErrorResponse)
+├── routes/        # Router + state wiring
+├── service/       # Business logic (MessageService)
+└── state/         # Per-feature app state (MessageState)
+```
 
-## Notes
+---
 
-- **Why Redis Streams?**
-  Writing directly to PostgreSQL on every HTTP request creates lock contention and I/O bottlenecks under extreme load. By publishing to Redis Streams first, the HTTP path remains fast (in-memory, append-only log), while the `sync` worker absorbs database write pressure via efficient batch inserts.
-
-- **Batch insert behavior.**
-  The sync worker reads up to 500 messages per Redis `XREADGROUP` call, then inserts them into PostgreSQL in a single query via `sqlx::QueryBuilder::push_values(...)`. Invalid / poison messages (bad JSON, missing `data` field) are ACKed immediately so they don't block the stream. If a batch insert fails, none of the messages in that batch are ACKed -- Redis redelivers them on the next read.
-
-- **Idempotency.**
-  Messages use server-generated UUIDs. The batch insert query includes `ON CONFLICT (id) DO NOTHING`, so duplicate deliveries (e.g., after a crash before ACK) are silently safe.
-
-- **Why this Rust port needs no PM2-style clustering (unlike the Node original).**
-  Node.js is **single-threaded per process** -- one event loop runs on one OS thread, so a single Node process can only ever use **one CPU core**. The Node original therefore *must* run under PM2 with `instances: "max"` and `exec_mode: "cluster"` (`ecosystem.config.cjs`) to fork one worker process per core and share the listening port via the OS cluster module. That clustering is not an optimization there -- it is the only way Node touches more than one core.
-
-  This Rust port does not need any of that. The runtime is configured at `src/main.rs` with the `#[tokio::main]` macro plus `tokio = { features = ["full"] }` in `Cargo.toml`. The `"full"` feature pulls in `rt-multi-thread`, so `#[tokio::main]` expands to `tokio::runtime::Builder::new_multi_thread().enable_all().build()` -- a **multi-thread work-stealing scheduler** with **one worker thread per logical CPU core** (default = `std::thread::available_parallelism()`). When `axum::serve` accepts a connection it becomes a tokio *task*, and tokio spreads tasks across all N worker threads (stealing work between them) **all inside a single process**. In other words: the parallelism the Node author obtains through N OS processes, Rust obtains through N OS threads in one process, automatically. That is why CPU utilization reaches ~99% (0--1% idle) here with **zero clustering code**.
-
-  |                       | Node (`node-1m-rps`)              | Rust (this repo)                         |
-  | --------------------- | --------------------------------- | ---------------------------------------- |
-  | Threads per process   | 1 (single event loop)             | N (= logical CPU cores)                  |
-  | Uses all cores        | only via PM2 `instances: "max"`    | automatic via tokio `rt-multi-thread`    |
-  | Clustering needed?    | **yes** (process-per-core)        | **no** (thread-per-core in one process)  |
-
-  Caveat: a single `TcpListener` + single accept loop means request *handling* is parallel across cores but connection *acceptance* is serialized on one task. With keep-alive + pipelining on a modest number of connections (as in the load test below) this is fine. PM2's N processes each get their own listener (via `SO_REUSEPORT`), so Node sidesteps the single-acceptor ceiling -- if that ever becomes the bottleneck here, `SO_REUSEPORT` + multiple processes would be the equivalent fix, but it is **not** required for basic core utilization.
-
-- **Migrations are CLI-only.** The app does *not* run migrations on startup -- always run `sqlx migrate run` after starting a fresh database container.
-- **Persist Postgres data across containers** by using a named volume, otherwise each new container starts empty:
-  ```bash
-  docker run -d --name message_db -p 5432:5432 \
-    -e POSTGRES_PASSWORD=mysecretpassword \
-    -e POSTGRES_USER=dbuser \
-    -e POSTGRES_DB=message \
-    -v message_pgdata:/var/lib/postgresql/data \
-    postgres:17
-  ```
-  Then reuse the same container with `docker start message_db` / `docker stop message_db`.
-
-- **Persist Redis data across containers** similarly:
-  ```bash
-  docker run -d --name message_redis -p 6379:6379 \
-    -v message_redisdata:/data \
-    redis:7 redis-server --appendonly yes
-  ```
+_This is the Rust implementation of [node-1m-rps](https://github.com/agile8118/node-1m-rps) by [@agile8118](https://github.com/agile8118). Benchmarks run with [autocannon](https://github.com/mcollina/autocannon). Thanks for reading — now go check your CPU idle graph._
