@@ -106,7 +106,7 @@ autocannon -m POST \
 
 I opened the core utilization graph while the test was running, and this is what I saw:
 
-![CPU core usage — direct Postgres writes](public/core_usage_before.png)
+![CPU core usage — direct Postgres writes](public/cpu_before.png)
 
 **50–55% idle. On every core. Under full load.**
 
@@ -252,7 +252,7 @@ autocannon -m POST \
 
 And the part I was most curious about — the CPU graph:
 
-![CPU core usage — Redis Streams write path](public/core_usage_after.png)
+![CPU core usage — Redis Streams write path](public/cpu_after.png)
 
 **Idle dropped from 50–55% to 6–7%.** The cores that were previously napping while handlers waited on Postgres are now actually processing requests. Same runtime, same thread count, same machine — the only change was removing the disk round-trip from the request path. The throughput gain didn't come from working *harder*; it came from stopping the CPU from *waiting*.
 
