@@ -1,0 +1,14 @@
+[package]
+name = "sync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+sqlx = { workspace = true }
+redis = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+shared = { workspace = true }

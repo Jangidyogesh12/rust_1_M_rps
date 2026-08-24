@@ -1,0 +1,15 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true }
+dotenv = { workspace = true }
+log = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
